@@ -1,0 +1,49 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Resources": {
+    "OrdersTopic": { "Type": "AWS::SNS::Topic" },
+
+    "OrdersDeadLetterQueue": { "Type": "AWS::SQS::Queue" },
+
+    "OrdersQueue": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "RedrivePolicy": {
+          "deadLetterTargetArn": { "Fn::GetAtt": ["OrdersDeadLetterQueue", "Arn"] },
+          "maxReceiveCount": 3
+        }
+      }
+    },
+
+    "OrdersQueuePolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "Queues": [{ "Ref": "OrdersQueue" }],
+        "PolicyDocument": {
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "sns.amazonaws.com" },
+            "Action": "sqs:SendMessage",
+            "Resource": { "Fn::GetAtt": ["OrdersQueue", "Arn"] },
+            "Condition": { "ArnEquals": { "aws:SourceArn": { "Ref": "OrdersTopic" } } }
+          }]
+        }
+      }
+    },
+
+    "OrdersSubscription": {
+      "Type": "AWS::SNS::Subscription",
+      "Properties": {
+        "TopicArn": { "Ref": "OrdersTopic" },
+        "Protocol": "sqs",
+        "Endpoint": { "Fn::GetAtt": ["OrdersQueue", "Arn"] },
+        "RawMessageDelivery": true
+      }
+    }
+  },
+  "Outputs": {
+    "OrdersTopicArn": { "Value": { "Ref": "OrdersTopic" } },
+    "OrdersQueueUrl": { "Value": { "Ref": "OrdersQueue" } },
+    "OrdersQueueArn": { "Value": { "Fn::GetAtt": ["OrdersQueue", "Arn"] } }
+  }
+}

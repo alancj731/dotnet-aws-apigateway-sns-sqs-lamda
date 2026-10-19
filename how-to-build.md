@@ -322,10 +322,15 @@ builder.AddAWSAPIGatewayEmulator("APIGatewayEmulator", APIGatewayType.HttpV2)
     .WithReference(ordersApi, Method.Any, "/{proxy+}");
 
 // Orders.Processor runs locally as a Lambda function, triggered by messages in the real SQS queue
-builder.AddAWSLambdaFunction<Projects.Orders_Processor>("OrdersProcessor",
+var ordersProcessor = builder.AddAWSLambdaFunction<Projects.Orders_Processor>("OrdersProcessor",
         lambdaHandler: "Orders.Processor::Orders.Processor.Function::FunctionHandler")
-    .WithReference(awsConfig)
-    .WithSQSEventSource(ordersResources, "OrdersQueueUrl");
+    .WithReference(awsConfig);
+
+// WithSQSEventSource needs the real queue URL at startup, before the stack above is created,
+// so it comes from config (user secret, set from the stack's OrdersQueueUrl output after the first run)
+var ordersQueueUrl = builder.Configuration["OrdersQueueUrl"];
+if (!string.IsNullOrEmpty(ordersQueueUrl))
+    ordersProcessor.WithSQSEventSource(ordersQueueUrl);
 
 builder.Build().Run();
 ```
@@ -337,8 +342,18 @@ Things to notice:
 - **The SNS topic and SQS queue are real** (in AWS); only the Lambda functions and API Gateway are emulated locally.
   Aspire installs the Lambda Test Tool it needs automatically on first run.
 
+- **The queue URL comes from config, not the stack.** In `Aspire.Hosting.AWS` 13.7.2, `WithSQSEventSource` only
+  takes the queue URL as a string, and it needs it at startup, before the stack exists. So the first run creates the
+  stack without the SQS trigger. After that, save the URL as a user secret and restart:
+
+  ```bash
+  url=$(aws cloudformation describe-stacks --stack-name orders-resources --profile youtube-demo \
+    --query "Stacks[0].Outputs[?OutputKey=='OrdersQueueUrl'].OutputValue" --output text)
+  dotnet user-secrets set OrdersQueueUrl "$url" --project src/Orders.AppHost
+  ```
+
 > `Aspire.Hosting.AWS`'s Lambda APIs are newer and have changed between versions. If a method above doesn't
-> compile, especially `WithSQSEventSource`, check the overloads in your IDE (Ctrl+Space) or the package's
+> compile, check the overloads in your IDE (Ctrl+Space) or the package's
 > README on GitHub (`aws/integrations-on-dotnet-aspire-for-aws`) for the version you installed.
 
 **Check it:** `dotnet build` → `Build succeeded`.
