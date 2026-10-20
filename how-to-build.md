@@ -397,12 +397,26 @@ whether **.NET 10** is listed. If it isn't, change `<TargetFramework>` to `net8.
 
 ### 6b. Get the resource values
 
+All commands below pass `--region ca-central-1` explicitly, so they work even if your profile's default region
+is different. Run them in one terminal session: later commands use shell variables set by earlier ones.
+
 ```bash
-aws cloudformation describe-stacks --stack-name orders-resources --profile youtube-demo \
+aws cloudformation describe-stacks --stack-name orders-resources --profile youtube-demo --region ca-central-1 \
   --query "Stacks[0].Outputs" --output table
+
+output() {
+  aws cloudformation describe-stacks --stack-name orders-resources --profile youtube-demo --region ca-central-1 \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+topicArn=$(output OrdersTopicArn)
+queueArn=$(output OrdersQueueArn)
+account=$(aws sts get-caller-identity --profile youtube-demo --query Account --output text)
 ```
 
 (If the stack has a different name, find it in the CloudFormation console.)
+
+> **Stop the AppHost first.** While it runs, the local `OrdersProcessor` polls the same `OrdersQueue`. With both
+> running, each order goes to whichever one picks it up first, so it can look like the AWS processor missed it.
 
 ### 6c. Deploy the processor and connect it to the queue
 
@@ -411,36 +425,225 @@ cd src/Orders.Processor
 dotnet lambda deploy-function OrdersProcessor \
   --function-handler "Orders.Processor::Orders.Processor.Function::FunctionHandler" \
   --function-runtime dotnet10 --region ca-central-1 --profile youtube-demo
-# when asked for a role: create a new one with the AWSLambdaSQSQueueExecutionRole policy
+```
 
+When it asks for a role, choose **Create new IAM Role**, name it `orders-processor-role`, and pick
+**`AWSLambdaSQSQueueExecutionRole`** (receive/delete SQS messages, plus CloudWatch Logs). Don't pick a
+`AWSLambdaBasicExecutionRole-<guid>` entry: those are copies the Lambda console made for another function, and
+they only allow writing to *that* function's log group.
+
+```bash
 aws lambda create-event-source-mapping --function-name OrdersProcessor \
-  --event-source-arn <OrdersQueueArn> --function-response-types ReportBatchItemFailures \
-  --profile youtube-demo
+  --event-source-arn $queueArn --function-response-types ReportBatchItemFailures \
+  --profile youtube-demo --region ca-central-1
 ```
 
 `ReportBatchItemFailures` makes Lambda respect the `SQSBatchResponse` from Step 3.
 
-### 6d. Deploy the API and put API Gateway in front
+### 6d. Deploy the API
 
 ```bash
 cd ../Orders.Api
 dotnet lambda deploy-function OrdersApi \
   --function-handler Orders.Api --function-runtime dotnet10 \
-  --environment-variables "AWS__Resources__OrdersTopicArn=<OrdersTopicArn>" \
+  --environment-variables "AWS__Resources__OrdersTopicArn=$topicArn" \
   --region ca-central-1 --profile youtube-demo
-# role: create a new one with AWSLambdaBasicExecutionRole, then add sns:Publish on the topic to it
+```
 
-aws apigatewayv2 create-api --name orders-api --protocol-type HTTP \
-  --target <OrdersApi-function-arn> --profile youtube-demo
-aws lambda add-permission --function-name OrdersApi --statement-id apigw \
-  --action lambda:InvokeFunction --principal apigateway.amazonaws.com --profile youtube-demo
+When it asks for a role, choose **Create new IAM Role** again (don't reuse the processor's), name it
+`orders-api-role`, and pick **`AWSLambdaBasicExecutionRole`** (option without a `-<guid>` suffix). That only
+covers logs, so allow publishing to the topic too, or every request fails with a 500
+(`not authorized to perform: SNS:Publish`):
+
+```bash
+aws iam put-role-policy --role-name orders-api-role --policy-name publish-orders-topic --profile youtube-demo \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sns:Publish\",\"Resource\":\"$topicArn\"}]}"
 ```
 
 `AWS__Resources__OrdersTopicArn` becomes the config key `AWS:Resources:OrdersTopicArn` (`__` = `:`), so
 `Program.cs` doesn't change between local and AWS.
 
-**Check it:** `curl -X POST <ApiEndpoint from create-api>/orders ...` returns 202, and the order appears in
-CloudWatch Logs under `/aws/lambda/OrdersProcessor`.
+### 6e. Put API Gateway in front
+
+```bash
+fnArn=$(aws lambda get-function --function-name OrdersApi --profile youtube-demo --region ca-central-1 \
+  --query "Configuration.FunctionArn" --output text)   # arn:aws:lambda:...:function:OrdersApi
+
+aws apigatewayv2 create-api --name orders-api --protocol-type HTTP --target $fnArn \
+  --profile youtube-demo --region ca-central-1
+
+apiId=$(aws apigatewayv2 get-apis --profile youtube-demo --region ca-central-1 \
+  --query "Items[?Name=='orders-api'].ApiId" --output text)
+endpoint=$(aws apigatewayv2 get-apis --profile youtube-demo --region ca-central-1 \
+  --query "Items[?Name=='orders-api'].ApiEndpoint" --output text)
+
+aws lambda add-permission --function-name OrdersApi --statement-id apigw \
+  --action lambda:InvokeFunction --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:ca-central-1:$account:$apiId/*" \
+  --profile youtube-demo --region ca-central-1
+```
+
+- `--target` turns on "quick create": one command makes the HTTP API, a Lambda proxy integration, a catch-all
+  `$default` route and an auto-deployed `$default` stage. ASP.NET Core does the routing, so `POST /orders` works.
+- `create-api` doesn't let API Gateway call the function; `add-permission` does. `--source-arn` limits that
+  to this one API (without it, any API Gateway could invoke `OrdersApi`).
+- Use the **Function ARN** (`...:function:OrdersApi`), not the *Runtime version ARN* (`...::runtime:<hash>`)
+  shown under Runtime settings in the console.
+
+**Check it:**
+
+```bash
+curl -i -X POST $endpoint/orders \
+  -H "Content-Type: application/json" \
+  -d '{"customerEmail":"test@example.com","total":42.50}'
+
+aws logs tail /aws/lambda/OrdersProcessor --since 5m --follow --profile youtube-demo --region ca-central-1
+```
+
+- curl shows `HTTP/2 202` and an `orderId`.
+- The log shows `Processing order <that id> for test@example.com, total 42.50` (Ctrl+C to stop following).
+
+If it doesn't work:
+
+- **500 from curl**: read the API's own log, `aws logs tail /aws/lambda/OrdersApi --since 5m ...`. Usual causes
+  are a missing `sns:Publish` on `orders-api-role`, a wrong `OrdersTopicArn`, or skipping `add-permission`.
+- **202 but nothing in the processor log**: check the AppHost isn't still running (see 6b), the event source
+  mapping exists (`aws lambda list-event-source-mappings --function-name OrdersProcessor ...`), and the
+  processor's role has `AWSLambdaSQSQueueExecutionRole`.
+
+---
+
+## Step 7: CI/CD, deploy the stack from GitHub Actions (optional)
+
+Locally, the AppHost sends `orders.template.json` to CloudFormation every time it starts. In a real deployment
+the AppHost doesn't run, so something else has to do it. In a real project that's a pipeline that deploys on
+every merge to `main`, so nobody deploys from their laptop.
+
+This step uses a separate stack, **`orders-prod`**, so the pipeline never touches the `orders-resources` stack
+your local AppHost owns. (If you do Step 6 against the pipeline's stack, read the outputs from `orders-prod` in 6b.)
+
+### 7a. Let GitHub sign in to AWS without keys (OIDC)
+
+Instead of storing access keys in GitHub, AWS trusts GitHub's identity tokens (OIDC). Each pipeline run gets
+temporary credentials for one role, and there's no secret to leak or rotate.
+
+Create the identity provider (once per AWS account):
+
+```bash
+aws iam create-open-id-connect-provider --profile youtube-demo \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+```
+
+Create `trust-policy.json` (outside the repo; replace `<github-user>/<repo>` with your GitHub repository):
+
+```bash
+account=$(aws sts get-caller-identity --profile youtube-demo --query Account --output text)
+cat > /tmp/trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${account}:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:<github-user>/<repo>:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+EOF
+```
+
+The `sub` condition means only the `main` branch of *your* repository can use the role. Without it, any
+GitHub repository could assume it.
+
+Create the role and give it the same permissions as your IAM user in Step 4a (fine for learning; a real
+project would narrow these down):
+
+```bash
+aws iam create-role --role-name github-actions-orders-deploy \
+  --assume-role-policy-document file:///tmp/trust-policy.json --profile youtube-demo
+
+for policy in AWSCloudFormationFullAccess AmazonSNSFullAccess AmazonSQSFullAccess; do
+  aws iam attach-role-policy --role-name github-actions-orders-deploy \
+    --policy-arn arn:aws:iam::aws:policy/$policy --profile youtube-demo
+done
+```
+
+Note the role ARN (`arn:aws:iam::<account>:role/github-actions-orders-deploy`) for 7c.
+
+### 7b. Write `.github/workflows/deploy-infra.yml`
+
+```yaml
+name: Deploy infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths: [src/Orders.AppHost/orders.template.json]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job request a GitHub OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://src/Orders.AppHost/orders.template.json
+
+      - name: Deploy stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name orders-prod \
+            --template-file src/Orders.AppHost/orders.template.json \
+            --no-fail-on-empty-changeset
+```
+
+Things to notice:
+- **`paths`**: the workflow only runs when the template changes. Code changes don't touch the infrastructure.
+  `workflow_dispatch` adds a "Run workflow" button in GitHub so you can also start it by hand.
+- **`id-token: write`**: without it, the job can't get the OIDC token and `configure-aws-credentials` fails.
+- **`validate-template`** catches JSON and CloudFormation syntax errors before anything is changed.
+- **`aws cloudformation deploy`** creates the stack the first time and updates it after that, changing only
+  what's different. `--no-fail-on-empty-changeset` makes a run with nothing to change succeed instead of failing.
+- The role ARN is a repository **variable**, not a secret: it isn't sensitive, and without the trust policy
+  in 7a nobody else can use it.
+
+### 7c. Push and run
+
+```bash
+# create an empty repository on GitHub first, then:
+git remote add origin git@github.com:<github-user>/<repo>.git
+git add .github/workflows/deploy-infra.yml
+git commit -m "Deploy infrastructure from GitHub Actions"
+git push -u origin main
+```
+
+In GitHub: **Settings → Secrets and variables → Actions → Variables → New repository variable**, name
+`AWS_DEPLOY_ROLE_ARN`, value the role ARN from 7a. Then **Actions → Deploy infrastructure → Run workflow**.
+
+**Check it:**
+- The run in the **Actions** tab is green.
+- In the AWS console, CloudFormation (ca-central-1) shows a stack `orders-prod` with the same five resources
+  as `orders-resources`.
+- Change something small in the template (e.g. add `"Properties": { "DisplayName": "Orders" }` to `OrdersTopic`),
+  push to `main`, and the workflow runs again and updates the stack.
+
+> Next step in a real project: move what you did by hand in Step 6 (both Lambdas, their roles, the SQS trigger
+> and API Gateway) into the template, or into AWS SAM or CDK, so the pipeline deploys the whole system.
 
 ---
 
@@ -449,11 +652,18 @@ CloudWatch Logs under `/aws/lambda/OrdersProcessor`.
 Delete what you created so nothing keeps costing money:
 
 ```bash
-aws cloudformation delete-stack --stack-name orders-resources --profile youtube-demo   # topic, queues, subscription
+aws cloudformation delete-stack --stack-name orders-resources --profile youtube-demo --region ca-central-1   # topic, queues, subscription
 # if you did Step 6:
-aws lambda delete-function --function-name OrdersApi --profile youtube-demo
-aws lambda delete-function --function-name OrdersProcessor --profile youtube-demo
-aws apigatewayv2 delete-api --api-id <api-id> --profile youtube-demo
+aws lambda delete-function --function-name OrdersApi --profile youtube-demo --region ca-central-1
+aws lambda delete-function --function-name OrdersProcessor --profile youtube-demo --region ca-central-1
+apiId=$(aws apigatewayv2 get-apis --profile youtube-demo --region ca-central-1 \
+  --query "Items[?Name=='orders-api'].ApiId" --output text)
+aws apigatewayv2 delete-api --api-id $apiId --profile youtube-demo --region ca-central-1
+# if you did Step 7:
+aws cloudformation delete-stack --stack-name orders-prod --profile youtube-demo --region ca-central-1
 ```
 
-Also delete the IAM roles `dotnet lambda` created (IAM console → Roles).
+Also delete the IAM roles `dotnet lambda` created, `orders-api-role` and `orders-processor-role` (IAM console →
+Roles). If you did Step 7, delete the role
+`github-actions-orders-deploy` too, and the GitHub identity provider (IAM console → Identity providers) if
+nothing else uses it.

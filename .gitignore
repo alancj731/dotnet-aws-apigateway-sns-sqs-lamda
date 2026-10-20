@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Lambda Test Tool saved requests (may contain real data)
+.aws-lambda-testtool/
