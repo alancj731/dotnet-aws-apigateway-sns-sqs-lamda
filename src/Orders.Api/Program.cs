@@ -11,7 +11,13 @@ builder.Services.AddAWSLambdaHosting(LambdaEventSource.HttpApi);
 builder.Services.AddDefaultAWSOptions(builder.Configuration.GetAWSOptions());
 builder.Services.AddAWSService<IAmazonSimpleNotificationService>();
 
+// Lets the Angular visualizer in /frontend (ng serve on port 4200) call the API from the browser
+builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
+    policy.WithOrigins("http://localhost:4200").AllowAnyHeader().AllowAnyMethod().WithExposedHeaders("Location")));
+
 var app = builder.Build();
+
+app.UseCors();
 
 app.MapPost("/orders", async (CreateOrderRequest request, IAmazonSimpleNotificationService sns, IConfiguration config) =>
 {
