@@ -1,0 +1,51 @@
+name: Deploy Orders.Api
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - src/Orders.Api/**
+      - src/Orders.Contracts/**
+      - .github/workflows/deploy-api.yml
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job request a GitHub OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Amazon.Lambda.Tools
+        run: dotnet tool install -g Amazon.Lambda.Tools
+
+      # Builds a Release zip ready for Lambda (same output `dotnet lambda deploy-function` uploads)
+      - name: Package
+        run: |
+          dotnet lambda package \
+            --project-location src/Orders.Api \
+            --configuration Release \
+            --framework net10.0 \
+            --function-architecture x86_64 \
+            --output-package artifacts/orders-api.zip
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      # Only the code changes: the function's role, handler and environment variables set in Step 6 stay as they are
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name OrdersApi \
+            --zip-file fileb://artifacts/orders-api.zip \
+            --query "[FunctionName,LastModified,CodeSha256]" --output text
+          aws lambda wait function-updated --function-name OrdersApi
