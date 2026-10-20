@@ -1,0 +1,32 @@
+name: Deploy infrastructure
+
+on:
+  push:
+    branches: [dev]
+    paths: [src/Orders.AppHost/orders.template.json]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job request a GitHub OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://src/Orders.AppHost/orders.template.json
+
+      - name: Deploy stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name orders-prod \
+            --template-file src/Orders.AppHost/orders.template.json \
+            --no-fail-on-empty-changeset
