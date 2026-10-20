@@ -535,10 +535,28 @@ aws iam create-open-id-connect-provider --profile youtube-demo \
   --client-id-list sts.amazonaws.com
 ```
 
-Create `trust-policy.json` (outside the repo; replace `<github-user>/<repo>` with your GitHub repository):
+A role has two policies: the *trust policy* says **who** may use it (here: GitHub Actions runs from your
+repository), and the *permissions policies* say **what** it can do. Write the trust policy to a temporary file
+outside the repo (it's only input for `create-role`, so there's nothing to commit).
+
+Run this block as-is in a shell, from the repo folder, **all in one terminal session**. The shell fills in
+`${account}`, `${repo}` and `${branch}`. If you write the file by hand or in an editor, they stay literal
+(`${account}`); if you run the lines in separate shells, they come out empty (`arn:aws:iam:::...`, `repo::`).
+Either way GitHub can't sign in.
 
 ```bash
+export AWS_PAGER=""   # stop the AWS CLI opening a pager, which pauses the commands that follow
+
 account=$(aws sts get-caller-identity --profile youtube-demo --query Account --output text)
+cd "$(git rev-parse --show-toplevel)"   # fails here, not silently below, if you're outside the repo
+repo=$(git remote get-url origin | sed -E 's#.*github\.com[:/]##; s#\.git$##')   # e.g. alancj731/my-repo
+branch=main   # must match the branch in the workflow's `on: push: branches:` (7b)
+
+# The start of the token's `sub` claim. Newer repos use an "immutable" form with IDs
+# (repo:alancj731@114266507/my-repo@1426445702), older ones plain repo:alancj731/my-repo; ask GitHub which.
+sub_prefix=$(gh api "repos/${repo}/actions/oidc/customization/sub" --jq .sub_claim_prefix)
+echo "$sub_prefix"   # must not be empty; if it is, run `gh auth login` and try again
+
 cat > /tmp/trust-policy.json <<EOF
 {
   "Version": "2012-10-17",
@@ -549,16 +567,20 @@ cat > /tmp/trust-policy.json <<EOF
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:<github-user>/<repo>:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "${sub_prefix}:ref:refs/heads/${branch}"
       }
     }
   }]
 }
 EOF
+
+grep -E 'Federated|:sub' /tmp/trust-policy.json   # check: a 12-digit account ID and your repo, no ${...} left
 ```
 
-The `sub` condition means only the `main` branch of *your* repository can use the role. Without it, any
-GitHub repository could assume it.
+The `sub` condition means only that branch of *your* repository can use the role. Without it, any GitHub
+repository could assume it. It has to match the token exactly: building it by hand as `repo:<user>/<repo>:...`
+fails on repositories that use the immutable form, which is why the prefix comes from GitHub. To allow every branch, change `StringEquals` to `StringLike` for the `sub` line
+(keep `aud` under `StringEquals`) and use `ref:refs/heads/*`.
 
 Create the role and give it the same permissions as your IAM user in Step 4a (fine for learning; a real
 project would narrow these down):
@@ -566,6 +588,9 @@ project would narrow these down):
 ```bash
 aws iam create-role --role-name github-actions-orders-deploy \
   --assume-role-policy-document file:///tmp/trust-policy.json --profile youtube-demo
+# "Role with name ... already exists"? Update its trust policy instead of deleting it:
+#   aws iam update-assume-role-policy --role-name github-actions-orders-deploy \
+#     --policy-document file:///tmp/trust-policy.json --profile youtube-demo
 
 for policy in AWSCloudFormationFullAccess AmazonSNSFullAccess AmazonSQSFullAccess; do
   aws iam attach-role-policy --role-name github-actions-orders-deploy \
@@ -573,7 +598,25 @@ for policy in AWSCloudFormationFullAccess AmazonSNSFullAccess AmazonSQSFullAcces
 done
 ```
 
-Note the role ARN (`arn:aws:iam::<account>:role/github-actions-orders-deploy`) for 7c.
+**Check it:**
+
+```bash
+aws iam get-role --role-name github-actions-orders-deploy --profile youtube-demo \
+  --query "Role.AssumeRolePolicyDocument.Statement[0].Principal.Federated" --output text
+aws iam list-attached-role-policies --role-name github-actions-orders-deploy --profile youtube-demo \
+  --query "AttachedPolicies[].PolicyName" --output text
+```
+
+The first should show your account ID (not `${account}`), the second the three policies. If the trust policy is
+wrong, the workflow fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity` (usually a `sub` that
+doesn't match: compare it with `echo "$sub_prefix"` and the branch in the workflow); if policies are missing,
+`cloudformation deploy` fails with `AccessDenied`.
+
+Get the role ARN (`arn:aws:iam::<account>:role/github-actions-orders-deploy`) and note it for 7c:
+
+```bash
+aws iam get-role --role-name github-actions-orders-deploy --profile youtube-demo --query Role.Arn --output text
+```
 
 ### 7b. Write `.github/workflows/deploy-infra.yml`
 
@@ -634,6 +677,9 @@ git push -u origin main
 
 In GitHub: **Settings → Secrets and variables → Actions → Variables → New repository variable**, name
 `AWS_DEPLOY_ROLE_ARN`, value the role ARN from 7a. Then **Actions → Deploy infrastructure → Run workflow**.
+
+That one variable is the only thing GitHub needs. Don't add `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or any
+other secret or token: each run gets its own short-lived credentials from the OIDC sign-in set up in 7a.
 
 **Check it:**
 - The run in the **Actions** tab is green.
